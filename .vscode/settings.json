@@ -1,0 +1,5 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\doc2t\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+  "prolog.executablePath": "C:\\Program Files\\swipl\\bin\\swipl.exe",
+  "prolog.dialect": "swi"
+}
