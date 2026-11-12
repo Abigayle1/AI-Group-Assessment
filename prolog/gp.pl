@@ -227,5 +227,14 @@ path_timedistance([A,B|Rest], Totald,Totalt) :-
     Totald is D + SubTotalD,
     Totalt is T + SubTotalT.
 
+addroad(Id,Source, Destination, Distance, Time, Type, Conditions, Status, Direction) :-
+    \+ connected(Source, Destination, _, _),
+    \+ road(id(Id),_,_,_,_,_,_,_,_),
+    assertz(road(id(Id), source(Source), destination(Destination), distance(Distance), time(Time), type(Type), conditions(Conditions), status(Status), direction(Direction))).
 
+updateroad(Source, Destination, Distance, Time, Type, Conditions, Status, Direction,NewCondition,NewStatus) :-
+    retract(road(id(_), source(Source), destination(Destination), distance(_), time(_), type(_), conditions(_), status(_), direction(_))),
+    (Conditions == none, NewCondition \== none -> Distance is Distance + 5;
+         Conditions \== none, NewCondition == none -> Distance is Distance - 5; true),
+    assertz(road(id(_), source(Source), destination(Destination), distance(Distance), time(Time), type(Type), conditions(NewCondition), status(NewStatus), direction(Direction))).
 
