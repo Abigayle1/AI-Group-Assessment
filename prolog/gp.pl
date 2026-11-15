@@ -70,7 +70,6 @@ find_edges(EdgesPerRoute, Edges) :-
 
 /* ---------- Shortest path ---------- */
 
-/* dijkstra(+Start, +Goal, -Path, -Cost) */
 dijkstra(Start, Goal, Path, Cost) :-
     dijkstra_([0-[Start]], Goal, [], RevPath, Cost),
     reverse(RevPath, Path).
@@ -94,7 +93,6 @@ dijkstra_([Cost-[Node|Rest]|Queue], Goal, Settled, Path, TotalCost) :-
 
 /* ---------- Fastest path ---------- */
 
-/* quickestpath(+Start, +Goal, -Path, -Cost) */
 quickestpath(Start, Goal, Path, Cost) :-
     quickestpath_([0-[Start]], Goal, [], RevPath, Cost),
     reverse(RevPath, Path).
@@ -182,7 +180,6 @@ h(Node, Goal, H) :-
     coord(Goal, X2, Y2),
     H is sqrt((X1-X2)*(X1-X2) + (Y1-Y2)*(Y1-Y2)).
 
-% astar(+Rules, +Start, +Goal, -Path, -Cost)
 astar(Rules, Start, Goal, Path, Cost) :-
     h(Start, Goal, H0),
     astar_([H0-(0-[Start])], Rules, Goal, [], RevPath, Cost),
