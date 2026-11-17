@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog
+
+# --- Provided Backend Code ---
+OPTIONS = {"avoid_unpaved", "avoid_broken_cisterns", "avoid_deep_potholes"}
+CONDITIONS = {"broken_cistern", "deep_pothole"}
+BRIDGE = Path(__file__).parent / "prolog" / "bridge.pl"
+
+
+class IntegrationError(RuntimeError):
+    """A useful error for the GUI to display."""
+
+
+def _number(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be a finite nonnegative number")
+
+
+def _choices(values, allowed, label):
+    if not isinstance(values, list) or any(not isinstance(v, str) or v not in allowed for v in values):
+        raise ValueError(f"Invalid {label}; allowed values: {', '.join(sorted(allowed))}")
+
+
+def validate_road(road):
+    if not isinstance(road, dict):
+        raise ValueError("Each road must be a dictionary")
+    for key in ("id", "source", "destination"):
+        if not isinstance(road.get(key), str) or not road[key].strip():
+            raise ValueError(f"Road {key} must be a nonempty string")
+    for key in ("distance", "time"):
+        _number(road.get(key), key)
+    for key, allowed in (("type", {"paved", "unpaved"}), ("status", {"open", "closed"}),
+                         ("direction", {"one_way", "two_way"})):
+        if road.get(key) not in allowed:
+            raise ValueError(f"Invalid road {key}")
+    _choices(road.get("conditions"), CONDITIONS, "conditions")
+
+
+class PrologClient:
+    def __init__(self, executable=None, timeout=10):
+        self.executable = executable or os.environ.get("SWIPL") or shutil.which("swipl")
+        fallback = Path("C:/Program Files/swipl/bin/swipl.exe")
+        if not self.executable and fallback.exists():
+            self.executable = str(fallback)
+        if not self.executable:
+            raise IntegrationError("SWI-Prolog was not found. Install it or set SWIPL to its executable path.")
+        self.timeout = timeout
+
+    def _call(self, request):
+        try:
+            result = subprocess.run(
+                [self.executable, "-q", "-s", str(BRIDGE)],
+                input=json.dumps(request, allow_nan=False), capture_output=True,
+                text=True, encoding="utf-8", timeout=self.timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise IntegrationError(f"Unable to run Prolog: {exc}") from exc
+        if result.returncode:
+            raise IntegrationError(f"Prolog failed: {result.stderr.strip()}")
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise IntegrationError("Prolog returned an invalid response") from exc
+        if not response.get("ok"):
+            raise IntegrationError(response.get("error", "Unknown Prolog error"))
+        return response
+
+    def condition_time(self, base_time, conditions):
+        _number(base_time, "base_time")
+        _choices(conditions, CONDITIONS, "conditions")
+        return self._call(dict(action="condition_time", base_time=base_time, conditions=conditions))["time"]
+
+    def eligible_edges(self, roads, options=None):
+        options = [] if options is None else options
+        _choices(options, OPTIONS, "route options")
+        if not isinstance(roads, list):
+            raise ValueError("Roads must be a list")
+        seen = set()
+        for road in roads:
+            validate_road(road)
+            if road["id"] in seen:
+                raise ValueError(f"Duplicate road id: {road['id']}")
+            seen.add(road["id"])
+        return self._call(dict(action="traversals", roads=roads, options=options))["edges"]
+
+    def find_route(self, roads, source, destination, options=None):
+        """Extended Prolog call supporting route finding with source/destination."""
+        options = [] if options is None else options
+        _choices(options, OPTIONS, "route options")
+        if not isinstance(roads, list):
+            raise ValueError("Roads must be a list")
+        return self._call(dict(action="find_route", roads=roads, source=source, destination=destination, options=options))
+
+
+# --- Tkinter GUI Application ---
+
+class RoadNetworkApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Road Network & Prolog Integration Dashboard")
+        self.geometry("1050x720")
+        
+        try:
+            self.client = PrologClient()
+        except IntegrationError as e:
+            messagebox.showwarning("Prolog Warning", f"{e}\n\nSome backend actions may fail if SWI-Prolog is not installed.")
+            self.client = None
+
+        # Initial sample data
+        self.roads_data = [
+            {
+                "id": "r1",
+                "source": "A",
+                "destination": "B",
+                "distance": 5.0,
+                "time": 10.0,
+                "type": "paved",
+                "status": "open",
+                "direction": "two_way",
+                "conditions": []
+            },
+            {
+                "id": "r2",
+                "source": "B",
+                "destination": "C",
+                "distance": 3.5,
+                "time": 8.0,
+                "type": "unpaved",
+                "status": "open",
+                "direction": "one_way",
+                "conditions": ["broken_cistern"]
+            }
+        ]
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Tab 1: User Route Finder
+        tab_finder = ttk.Frame(notebook)
+        notebook.add(tab_finder, text="Find Route & Navigation")
+        self.setup_route_finder_tab(tab_finder)
+
+        # Tab 2: Admin Dashboard (Road Management & Updates)
+        tab_admin = ttk.Frame(notebook)
+        notebook.add(tab_admin, text="Administrator: Road Management")
+        self.setup_admin_tab(tab_admin)
+
+        # Tab 3: Condition Time Calculator
+        tab_time = ttk.Frame(notebook)
+        notebook.add(tab_time, text="Condition Time Calculator")
+        self.setup_time_tab(tab_time)
+
+    def setup_route_finder_tab(self, parent):
+        # Left frame: Controls (Source, Destination, Options)
+        control_frame = ttk.LabelFrame(parent, text="Route Parameters")
+        control_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=10, pady=10, ipadx=10)
+
+        ttk.Label(control_frame, text="Source Node:").pack(anchor=tk.W, pady=(10, 2))
+        self.source_entry = ttk.Entry(control_frame, width=25)
+        self.source_entry.insert(0, "A")
+        self.source_entry.pack(anchor=tk.W, pady=5)
+
+        ttk.Label(control_frame, text="Destination Node:").pack(anchor=tk.W, pady=(10, 2))
+        self.dest_entry = ttk.Entry(control_frame, width=25)
+        self.dest_entry.insert(0, "C")
+        self.dest_entry.pack(anchor=tk.W, pady=5)
+
+        ttk.Label(control_frame, text="Routing Criteria / Options:", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(15, 5))
+        
+        self.option_vars = {}
+        for opt in sorted(OPTIONS):
+            var = tk.BooleanVar(value=False)
+            self.option_vars[opt] = var
+            ttk.Checkbutton(control_frame, text=opt.replace("_", " ").title(), variable=var).pack(anchor=tk.W, pady=3)
+
+        ttk.Button(control_frame, text="Find Optimal Route", command=self.find_route_action).pack(fill=tk.X, pady=(25, 10))
+
+        # Right frame: Results Display (Path, Distance, Travel Time, Messages)
+        result_frame = ttk.LabelFrame(parent, text="Navigation Results & Recommendations")
+        result_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        metrics_frame = ttk.Frame(result_frame)
+        metrics_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Label(metrics_frame, text="Total Distance:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.lbl_distance = ttk.Label(metrics_frame, text="-", font=("Arial", 10))
+        self.lbl_distance.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(metrics_frame, text="Total Travel Time:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.lbl_time = ttk.Label(metrics_frame, text="-", font=("Arial", 10))
+        self.lbl_time.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(result_frame, text="Recommended Path Sequence:", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 2))
+        self.route_output_text = tk.Text(result_frame, height=12, wrap=tk.WORD, font=("Courier", 10))
+        self.route_output_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    def find_route_action(self):
+        if not self.client:
+            messagebox.showerror("Error", "Prolog client is not initialized.")
+            return
+        
+        source = self.source_entry.get().strip()
+        destination = self.dest_entry.get().strip()
+        options = [opt for opt, var in self.option_vars.items() if var.get()]
+
+        if not source or not destination:
+            messagebox.showerror("Validation Error", "Source and Destination cannot be empty.")
+            return
+
+        try:
+            res = self.client.find_route(self.roads_data, source, destination, options)
+            if not res.get("found", True):
+                self.lbl_distance.config(text="N/A")
+                self.lbl_time.config(text="N/A")
+                self.route_output_text.delete("1.0", tk.END)
+                self.route_output_text.insert(tk.END, f"No route found between '{source}' and '{destination}' under selected criteria.")
+                messagebox.showinfo("No Route", f"No valid route found from {source} to {destination}.")
+                return
+
+            self.lbl_distance.config(text=f"{res.get('distance', 0.0)} units")
+            self.lbl_time.config(text=f"{res.get('time', 0.0)} mins")
+            
+            self.route_output_text.delete("1.0", tk.END)
+            self.route_output_text.insert(tk.END, json.dumps(res, indent=2))
+        except (ValueError, IntegrationError) as e:
+            messagebox.showerror("Routing Error", str(e))
+
+    def setup_admin_tab(self, parent):
+        # Admin Top Controls (Add, Edit, Delete, Save, Load)
+        top_btn_frame = ttk.Frame(parent)
+        top_btn_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(top_btn_frame, text="Add New Road", command=self.open_add_road_dialog).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_btn_frame, text="Update Selected Road", command=self.open_edit_road_dialog).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_btn_frame, text="Delete Selected Road", command=self.delete_selected_road).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_btn_frame, text="Save Database", command=self.save_roads).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(top_btn_frame, text="Load Database", command=self.load_roads).pack(side=tk.RIGHT, padx=5)
+
+        # Admin Table (Road Database)
+        table_frame = ttk.LabelFrame(parent, text="Administrator Road Database Control")
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.tree = ttk.Treeview(table_frame, columns=("id", "src", "dest", "dist", "time", "type", "status", "dir", "cond"), show="headings", height=16)
+        
+        columns_config = [
+            ("id", "ID", 50), ("src", "Source", 60), ("dest", "Dest", 60),
+            ("dist", "Dist", 60), ("time", "Time", 60), ("type", "Type", 70),
+            ("status", "Status", 70), ("dir", "Direction", 80), ("cond", "Conditions", 150)
+        ]
+        
+        for col, heading, width in columns_config:
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=width)
+        
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.refresh_admin_tree()
+
+    def refresh_admin_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for road in self.roads_data:
+            self.tree.insert("", tk.END, values=(
+                road["id"], road["source"], road["destination"],
+                road["distance"], road["time"], road["type"],
+                road["status"], road["direction"], ", ".join(road["conditions"])
+            ))
+
+    def delete_selected_road(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a road to delete from the table.")
+            return
+        for item in selected:
+            vals = self.tree.item(item, "values")
+            road_id = vals[0]
+            self.roads_data = [r for r in self.roads_data if r["id"] != road_id]
+        self.refresh_admin_tree()
+        messagebox.showinfo("Success", "Selected road(s) deleted successfully.")
+
+    def open_add_road_dialog(self):
+        self._open_road_form("Add New Road", None)
+
+    def open_edit_road_dialog(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Please select a road from the table to update.")
+            return
+        road_id = self.tree.item(selected[0], "values")[0]
+        road_to_edit = next((r for r in self.roads_data if r["id"] == road_id), None)
+        if road_to_edit:
+            self._open_road_form("Update Road Details", road_to_edit)
+
+    def _open_road_form(self, title, existing_road):
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.geometry("380x480")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        fields = [
+            ("ID:", "id", existing_road["id"] if existing_road else "r3"),
+            ("Source:", "source", existing_road["source"] if existing_road else "A"),
+            ("Destination:", "destination", existing_road["destination"] if existing_road else "C"),
+            ("Distance:", "distance", str(existing_road["distance"]) if existing_road else "5.0"),
+            ("Time:", "time", str(existing_road["time"]) if existing_road else "10.0")
+        ]
+
+        entries = {}
+        for idx, (label, key, default) in enumerate(fields):
+            ttk.Label(dialog, text=label).grid(row=idx, column=0, sticky=tk.W, padx=15, pady=5)
+            ent = ttk.Entry(dialog)
+            ent.insert(0, default)
+            if existing_road and key == "id":
+                ent.config(state="readonly") # Prevent ID collision tampering during edits
+            ent.grid(row=idx, column=1, padx=15, pady=5)
+            entries[key] = ent
+
+        ttk.Label(dialog, text="Type:").grid(row=5, column=0, sticky=tk.W, padx=15, pady=5)
+        type_cb = ttk.Combobox(dialog, values=["paved", "unpaved"], state="readonly")
+        type_cb.set(existing_road["type"] if existing_road else "paved")
+        type_cb.grid(row=5, column=1, padx=15, pady=5)
+
+        ttk.Label(dialog, text="Status:").grid(row=6, column=0, sticky=tk.W, padx=15, pady=5)
+        status_cb = ttk.Combobox(dialog, values=["open", "closed"], state="readonly")
+        status_cb.set(existing_road["status"] if existing_road else "open")
+        status_cb.grid(row=6, column=1, padx=15, pady=5)
+
+        ttk.Label(dialog, text="Direction:").grid(row=7, column=0, sticky=tk.W, padx=15, pady=5)
+        dir_cb = ttk.Combobox(dialog, values=["one_way", "two_way"], state="readonly")
+        dir_cb.set(existing_road["direction"] if existing_road else "two_way")
+        dir_cb.grid(row=7, column=1, padx=15, pady=5)
+
+        cond_frame = ttk.LabelFrame(dialog, text="Hazards / Conditions")
+        cond_frame.grid(row=8, column=0, columnspan=2, sticky=tk.EW, padx=15, pady=5)
+        cond_vars = {}
+        existing_conds = existing_road["conditions"] if existing_road else []
+        for c in sorted(CONDITIONS):
+            v = tk.BooleanVar(value=(c in existing_conds))
+            cond_vars[c] = v
+            ttk.Checkbutton(cond_frame, text=c.replace("_", " ").title(), variable=v).pack(anchor=tk.W, padx=10)
+
+        def save():
+            try:
+                updated_road = {
+                    "id": entries["id"].get().strip(),
+                    "source": entries["source"].get().strip(),
+                    "destination": entries["destination"].get().strip(),
+                    "distance": float(entries["distance"].get()),
+                    "time": float(entries["time"].get()),
+                    "type": type_cb.get(),
+                    "status": status_cb.get(),
+                    "direction": dir_cb.get(),
+                    "conditions": [c for c, var in cond_vars.items() if var.get()]
+                }
+                validate_road(updated_road)
+                
+                if existing_road:
+                    # Update existing record
+                    self.roads_data = [updated_road if r["id"] == updated_road["id"] else r for r in self.roads_data]
+                else:
+                    # Add new record
+                    if any(r["id"] == updated_road["id"] for r in self.roads_data):
+                        raise ValueError(f"Road ID '{updated_road['id']}' already exists.")
+                    self.roads_data.append(updated_road)
+
+                self.refresh_admin_tree()
+                dialog.destroy()
+                messagebox.showinfo("Success", "Road details updated successfully!")
+            except Exception as e:
+                messagebox.showerror("Validation & Input Error", str(e))
+
+        ttk.Button(dialog, text="Save Road Details", command=save).grid(row=9, column=0, columnspan=2, pady=15)
+
+    def save_roads(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")], title="Save Roads")
+        if not file_path:
+            return
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(self.roads_data, f, indent=2)
+            messagebox.showinfo("Success", f"Database saved successfully to {file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save file: {e}")
+
+    def load_roads(self):
+        file_path = filedialog.askopenfilename(filetypes=[("JSON Files", "*.json")], title="Load Roads")
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("JSON file must contain a list of roads.")
+            seen = set()
+            for road in data:
+                validate_road(road)
+                if road["id"] in seen:
+                    raise ValueError(f"Duplicate road ID in file: {road['id']}")
+                seen.add(road["id"])
+            self.roads_data = data
+            self.refresh_admin_tree()
+            messagebox.showinfo("Success", f"Loaded {len(data)} roads successfully.")
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load roads: {e}")
+
+    def setup_time_tab(self, parent):
+        frame = ttk.LabelFrame(parent, text="Condition Time Evaluator")
+        frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        ttk.Label(frame, text="Base Time (mins):").grid(row=0, column=0, sticky=tk.W, padx=10, pady=10)
+        self.base_time_entry = ttk.Entry(frame)
+        self.base_time_entry.insert(0, "15.0")
+        self.base_time_entry.grid(row=0, column=1, sticky=tk.W, padx=10, pady=10)
+
+        ttk.Label(frame, text="Conditions:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=10)
+        self.cond_vars = {}
+        cond_frame = ttk.Frame(frame)
+        cond_frame.grid(row=1, column=1, sticky=tk.W, padx=10, pady=10)
+        for c in sorted(CONDITIONS):
+            v = tk.BooleanVar(value=False)
+            self.cond_vars[c] = v
+            ttk.Checkbutton(cond_frame, text=c.replace("_", " ").title(), variable=v).pack(anchor=tk.W, pady=2)
+
+        ttk.Button(frame, text="Calculate Condition Time", command=self.calculate_condition_time).grid(row=2, column=0, columnspan=2, pady=20)
+
+        ttk.Label(frame, text="Adjusted Time Result:", font=("Arial", 10, "bold")).grid(row=3, column=0, sticky=tk.W, padx=10, pady=10)
+        self.time_result_label = ttk.Label(frame, text="-", font=("Arial", 11, "bold"), foreground="blue")
+        self.time_result_label.grid(row=3, column=1, sticky=tk.W, padx=10, pady=10)
+
+    def calculate_condition_time(self):
+        if not self.client:
+            messagebox.showerror("Error", "Prolog client is not initialized.")
+            return
+        try:
+            base_time = float(self.base_time_entry.get())
+            conditions = [c for c, var in self.cond_vars.items() if var.get()]
+            res_time = self.client.condition_time(base_time, conditions)
+            self.time_result_label.config(text=f"{res_time} mins")
+        except ValueError as e:
+            messagebox.showerror("Input Error", f"Invalid base time: {e}")
+        except IntegrationError as e:
+            messagebox.showerror("Prolog Error", str(e))
+
+if __name__ == "__main__":
+    app = RoadNetworkApp()
+    app.mainloop()
